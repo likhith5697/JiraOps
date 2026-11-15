@@ -1,0 +1,42 @@
+services:
+  opsbridge:
+    build:
+      context: .
+      target: runtime
+    image: opsbridge:local
+    ports:
+      # Host port is configurable: OPSBRIDGE_PORT=9000 docker compose up -d
+      - "${OPSBRIDGE_PORT:-8080}:8000"
+    env_file:
+      - path: .env
+        required: false   # runs in mock mode with no .env at all
+    environment:
+      DATABASE_URL: sqlite:////data/opsbridge.db
+    volumes:
+      - opsbridge-data:/data
+    restart: unless-stopped
+
+  # Test suite in a container:  docker compose --profile test run --rm tests
+  tests:
+    build:
+      context: .
+      target: test
+    image: opsbridge:test
+    profiles: ["test"]
+
+  # Optional public tunnel for real Microsoft Graph webhooks:
+  #   NGROK_AUTHTOKEN=... docker compose --profile tunnel up -d
+  # The public URL is shown at http://localhost:4040 - put it in APP_BASE_URL.
+  ngrok:
+    image: ngrok/ngrok:3
+    profiles: ["tunnel"]
+    command: ["http", "opsbridge:8000", "--log", "stdout"]
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    ports:
+      - "4040:4040"
+    depends_on:
+      - opsbridgegive
+
+volumes:
+  opsbridge-data:

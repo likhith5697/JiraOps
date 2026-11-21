@@ -78,6 +78,8 @@ open Jira. Commands are case-insensitive, may start with `/`, and must be the fi
 | `close [reason]` | Requester or support admin | Transitions the issue to `JIRA_CLOSE_STATUS`, adds a Jira comment and replies. The request becomes `CLOSED` |
 | `reopen [reason]` | Requester or support admin | Only works on a closed ticket. Transitions it to `JIRA_REOPEN_STATUS`, comments, replies. The request goes back to `COMPLETED` |
 | `escalate P1\|P2\|P3 [reason]` | Requester or support admin | **Raises** the priority (never lowers it): sets the Jira priority, adds the `escalated` label and a comment, **posts an alert in the escalation channel**, and replies |
+| `ask <question>` | Anyone | Searches past resolved tickets and answers in the thread, citing them. Also works as a new channel message. Never creates a ticket ([details](#ai-assisted-self-service-ask)) |
+| `helpful` / `not helpful` | Anyone (once each) | Rates an `ask` answer. This adjusts how those past fixes rank in future answers |
 
 *Support admins* are the Entra object IDs in `TEAMS_COMMAND_ADMIN_USER_IDS`. Anyone else who tries a write command gets
 *"You're not allowed to {close|reopen|escalate} OPS-1. Only the requester or a support admin can."*, and Jira is not touched.
@@ -192,6 +194,107 @@ Jira: https://your-site.atlassian.net/browse/OPS-1
 * **No echo.** A `close`/`reopen` from Teams has already replied, so its status change isn't posted again.
 * **Stays in step.** Closing the issue in Jira marks the request `CLOSED`, and reopening it in Jira sets it back to `COMPLETED`.
 
+### AI-assisted self-service (`ask`)
+
+Before filing a ticket, anyone can ask whether this has happened before. OpsBridge answers **only from past
+resolved tickets** and cites them. The knowledge base fills itself: every closed ticket becomes a
+"problem → fix" entry.
+
+**Example conversation (support channel):**
+
+```text
+Priya:      ask CustomerOrderAPI returns HTTP 500 on order creation in QA after a deploy - known fix?
+
+OpsBridge:  This matches [OPS-12] (QA): the new build broke order validation; rolling back the
+            order-service deployment fixed it. A similar issue in PROD [OPS-31] was fixed the same way.
+            Reply `helpful` or `not helpful`. Still stuck? Post a support request and a ticket will be created.
+
+Priya:      helpful
+OpsBridge:  👍 Thanks! Your feedback helps OpsBridge rank the most useful fixes first.
+```
+
+`ask` works as a new channel message or as a reply in any request or answer thread. It **never** creates a Jira
+ticket. With nothing relevant (`ASK_MIN_SCORE`), the answer is *"I couldn't find a similar resolved issue. Please
+post a support request using the template."* together with the template.
+
+**How it works**
+
+| Step | What happens |
+|---|---|
+| **Capture** (on every close) | Close reason + newest human Jira comments → optional LLM summary (`RESOLUTION_SUMMARY_V2`: 2–4 sentences, the fix plus the root cause if stated, no speculation. The model replies `NO_RESOLUTION` when the notes contain no actual fix, and the ticket is skipped) → **redacted** → saved → embedded. Tickets closed directly in Jira are captured by a background sweep. Closes with no meaningful text (`close`, `close fixed`) are skipped, and the close reply suggests adding a reason next time |
+| **Retrieve** | Hybrid search: SQLite FTS5 keyword (BM25 + term coverage) and embedding cosine, blended 0.6 / 0.4, plus boosts for same API (+0.15), environment, HTTP code, recency and helpful feedback, and a penalty for not-helpful feedback. Top `ASK_TOP_K` above `ASK_MIN_SCORE` |
+| **Answer** | LLM on and within budget: `ASK_ANSWER_V1` sees **only** the retrieved tickets, and every Jira key it cites must be one of them, otherwise the answer is discarded. Otherwise, or on any LLM problem, a formatted list of the past fixes (key + link, environment, date, problem, fix) |
+| **Learn** | `helpful` / `not helpful` replies, once per person, adjust the ranking of the cited fixes. The asker's verdict feeds the deflection metric |
+
+```mermaid
+sequenceDiagram
+    actor E as Engineer
+    participant T as Teams
+    participant OB as OpsBridge
+    participant J as Jira
+    participant L as LLM / embeddings (optional)
+    participant KB as Knowledge base
+    rect rgb(235, 245, 255)
+    note over E,KB: Capture - every close grows the knowledge base
+    E->>T: close Rolled back the deployment
+    T->>OB: reply notification
+    OB->>J: transition to Done + comment
+    OB->>J: GET newest comments
+    OB->>L: summarise (RESOLUTION_SUMMARY_V2, redacted input)
+    OB->>KB: save problem → fix (redacted) + embedding
+    end
+    rect rgb(240, 255, 240)
+    note over E,KB: Ask - answered only from past tickets
+    E->>T: ask order creation 500 in QA?
+    T->>OB: notification (never becomes a ticket)
+    OB->>L: embed question
+    OB->>KB: FTS5 keyword + cosine, boosts, threshold
+    OB->>L: ASK_ANSWER_V1 with ONLY retrieved tickets
+    OB->>OB: validate citations (else keyword answer)
+    OB->>T: answer citing [OPS-12] + feedback prompt
+    E->>T: helpful
+    T->>OB: reply notification
+    OB->>KB: helpful_count += 1 (once per person)
+    end
+```
+
+**LLM providers** (chat and embeddings are configured separately; everything works with `LLM_ENABLED=false`):
+
+| Provider | Chat | Embeddings | Notes |
+|---|---|---|---|
+| `anthropic` | ✅ Claude (default `claude-opus-5-5`) | – | Needs `LLM_API_KEY`. Pair it with `EMBEDDING_PROVIDER=openai`, `ollama` or `mock` |
+| `openai` | ✅ (default `gpt-4o-mini`) | ✅ (`text-embedding-3-small`) | Needs `LLM_API_KEY` / `EMBEDDING_API_KEY` |
+| `ollama` | ✅ (default `llama3.1`) | ✅ (`nomic-embed-text`) | **Free and local**, no data leaves your machine |
+| `mock` | ✅ deterministic | ✅ word-hashing vectors | Default. Offline, used in tests and demos |
+
+Free local setup with Ollama:
+
+```bash
+ollama pull llama3.1
+ollama pull nomic-embed-text
+# .env
+LLM_ENABLED=true
+LLM_PROVIDER=ollama
+EMBEDDING_PROVIDER=ollama
+OLLAMA_BASE_URL=http://host.docker.internal:11434   # Ollama on the host, OpsBridge in Docker
+docker compose up -d --force-recreate
+docker compose exec opsbridge python scripts/backfill_knowledge.py   # (re)embed existing entries
+```
+
+**Privacy and safety**
+* **Redaction before storage and before every LLM call:** emails, bearer tokens and JWTs, `password=` /
+  `api_key:` style secrets, known key prefixes, long hex or base64 strings, and phone numbers. Jira keys, correlation IDs,
+  HTTP codes and dates are kept because they're useful for search.
+* **Grounding rule:** answers come only from past tickets, and citations are checked mechanically. An answer that cites
+  something that wasn't retrieved is never shown.
+* **Cost control:** `LLM_DAILY_TOKEN_BUDGET` counts chat and embedding tokens per UTC day, stored in the database so a
+  restart doesn't reset it. When the budget runs out, answers continue in keyword mode. Every call is logged with provider,
+  model, tokens and latency, never prompt text.
+* **Resilience:** timeouts, retries with backoff for 429 and 5xx, and any LLM failure falls back to the non-LLM answer.
+  A `close` never fails because of the LLM.
+
+Design rationale (hybrid search, grounding, FTS5, the PostgreSQL + pgvector path): [docs/design-decisions.md](docs/design-decisions.md).
+
 ## Architecture
 
 ```mermaid
@@ -304,6 +407,9 @@ opsbridge/
 │   │   ├── command_parser.py         # reply text -> Command: close, reopen, status, escalate
 │   │   ├── command_handler.py        # thread commands: intake, authorization, execution
 │   │   ├── jira_sync_service.py      # Jira -> Teams: change detection (poll + webhook), thread updates
+│   │   ├── knowledge_service.py      # close -> knowledge entry (summary, redaction, embedding)
+│   │   ├── knowledge_search.py       # hybrid FTS5 + embedding retrieval with boosts
+│   │   ├── ask_service.py            # `ask`: grounded answers, citation validation, feedback, metrics
 │   │   ├── message_processor.py      # state machine, idempotency, retries
 │   │   ├── request_parser.py         # RequestParser protocol + template parser
 │   │   ├── request_validator.py      # business rules
@@ -312,12 +418,13 @@ opsbridge/
 │   │   ├── notification_service.py   # Teams replies
 │   │   ├── subscription_service.py   # Graph subscription lifecycle
 │   │   └── support_request_service.py# admin queries + safe manual retry
-│   ├── models/                  # SupportRequest, TeamsCommand, TeamsNotification, GraphSubscription
+│   ├── llm/                     # provider-neutral LLM layer: base, anthropic/openai/ollama/mock, gateway, redaction, prompts/
+│   ├── models/                  # SupportRequest, TeamsCommand, TeamsNotification, KnowledgeEntry, AskQuery, GraphSubscription
 │   ├── repositories/            # all SQL: idempotent inserts, shared lease/claim helpers, queries
 │   ├── schemas/                 # API + Graph payload schemas
 │   ├── workers/background.py    # thread pool + sweeper
 │   └── database/                # engine/session, UTC datetime type, additive migrations
-├── tests/                       # 229 tests, all external calls mocked
+├── tests/                       # 299 tests, all external calls mocked
 ├── scripts/                     # init_db, simulate_teams_message, get_delegated_token
 ├── docs/                        # architecture, Microsoft setup, Jira setup
 ├── Dockerfile · docker-compose.yml · .env.example · requirements*.txt
@@ -409,6 +516,12 @@ Nothing tenant-specific is hard-coded: project key, issue type and priority name
 | `JIRA_SYNC_ENABLED` | `true` | Post Jira status/assignee changes in the request thread |
 | `JIRA_SYNC_POLL_INTERVAL_SECONDS` | `120` | How often to poll Jira for changes. `0` = webhook only |
 | `JIRA_WEBHOOK_SECRET` | – | Enables `POST /webhooks/jira` (HMAC `X-Hub-Signature` or `?secret=`). Empty = disabled |
+| `LLM_ENABLED` | `false` | Use an LLM for resolution summaries and `ask` answers. Off = deterministic answers |
+| `LLM_PROVIDER` / `LLM_MODEL` / `LLM_API_KEY` | `mock` / provider default / – | `anthropic`, `openai`, `ollama` or `mock` |
+| `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` / `EMBEDDING_API_KEY` | `mock` / provider default / – | `openai`, `ollama`, `mock` or `none` (keyword search only) |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Local Ollama server (`http://host.docker.internal:11434` from Docker) |
+| `LLM_TIMEOUT_SECONDS` / `LLM_DAILY_TOKEN_BUDGET` | `30` / `200000` | Per-call timeout. Tokens per UTC day (chat + embeddings, `0` = unlimited) |
+| `ASK_MIN_SCORE` / `ASK_TOP_K` | `0.35` / `3` | Relevance threshold (0–1) and number of past fixes used per answer |
 | `GRAPH_SUBSCRIPTION_LIFETIME_MINUTES` | `4200` | ≤ 4230 (Graph max is ~3 days for chat messages) |
 | `GRAPH_SUBSCRIPTION_RENEWAL_THRESHOLD_MINUTES` | `720` | Renew when expiry is closer than this |
 | `JIRA_BASE_URL` / `JIRA_EMAIL` / `JIRA_API_TOKEN` | – | Jira Cloud basic auth (API token) |
@@ -441,6 +554,10 @@ Interactive OpenAPI docs are at `/docs` (except in production). Admin endpoints 
 | `GET` | `/support-requests/{id}` | admin | Full detail: fields, validation errors, Jira, acknowledgement, close/escalation details, last Jira status and assignee, thread `commands` and `notifications`, trace ID |
 | `POST` | `/support-requests/{id}/retry` | admin | `202`. Resumes a `FAILED` request at the right stage. `409` if completed, closed or currently processing |
 | `POST` | `/dev/simulate-message` | admin, mock only | Feeds a Graph-shaped message and notification through the real ingestion path |
+| `GET` | `/knowledge` | admin | Knowledge entries, `?api_name=&environment=&limit=&offset=` |
+| `GET` / `DELETE` | `/knowledge/{id}` | admin | One entry. `DELETE` removes a wrong or outdated fix (also from search) |
+| `GET` | `/ask-queries` | admin | Questions asked, with mode (`llm`/`keyword`/`none`), sources, score, answer and feedback |
+| `GET` | `/metrics/deflection` | admin | Total asks, answered %, helpful %, **tickets avoided** (helpful answer, and no support request from the same person for the same API within 24 h) |
 | `POST` | `/dev/jira-change` | admin, mock only | Simulate a status/assignee change in mock Jira, then run the sync poll |
 | `GET` | `/dev/mock-state` | admin, mock only | Mock Jira issues, Teams replies and subscriptions |
 | `POST` | `/dev/fail-next` | admin, mock only | Queue failure modes on the mock clients |
@@ -479,7 +596,7 @@ curl -s localhost:8080/support-requests/1 -H "X-API-Key: dev-admin-key"
 ## Testing
 
 ```bash
-docker compose --profile test run --rm tests    # 229 tests, no network access (or: pytest, outside Docker)
+docker compose --profile test run --rm tests    # 299 tests, no network access (or: pytest, outside Docker)
 ```
 
 | Scenario | Where |
@@ -500,6 +617,9 @@ docker compose --profile test run --rm tests    # 229 tests, no network access (
 | Command parsing (`close`, `/close`, `CLOSE reason`, `closed` not matching, `escalate` arguments, whitespace) | `test_command_parser.py` |
 | `status`, `reopen`, `escalate`: permissions, refusals, escalation alert, priority fallback, retries, ambiguity, duplicates | `test_more_commands.py` |
 | Jira → Teams sync: polling, webhook signature, duplicates, out-of-order, no echo, closed/reopened in Jira, concurrency, delivery retries | `test_jira_sync.py` |
+| LLM layer: redaction, provider HTTP shapes, budget, usage logging, failure → fallback | `test_llm.py` |
+| Knowledge capture: on close, LLM summary, skip rules, redaction, embeddings, FTS sync, sweep, backfill | `test_knowledge.py` |
+| `ask`: hybrid ranking, threshold, citation validation, LLM failure/budget fallback, no tickets, idempotency, feedback, metrics, API | `test_ask.py` |
 | Additive schema migration of an existing database | `test_close_command.py::test_additive_migration_upgrades_an_old_database` |
 
 The real HTTP clients are tested against `httpx.MockTransport` responses that imitate Jira, Graph and Entra ID, including
@@ -540,6 +660,8 @@ status codes, error bodies, timeouts and `Retry-After`. Service-level tests use 
   Request paths are logged without query strings.
 * **Least privilege:** `ChannelMessage.Read.All` is tenant-wide, so prefer resource-specific consent for production.
   Use a dedicated service account for replies and a dedicated Jira user with only *Browse* and *Create* in one project.
+* **AI data handling:** text is redacted before it's stored as knowledge or sent to an LLM provider. A daily token budget
+  is enforced. Prompts are never logged. Answers are limited to retrieved tickets, with citations checked.
 * **Injection:** user-supplied values are HTML-escaped in Teams replies, sent as ADF text nodes to Jira (not wiki
   markup), and JQL values are quoted and escaped.
 * **Container:** runs as a non-root user. `.env` is excluded from git and from the Docker build context.
@@ -563,6 +685,14 @@ status codes, error bodies, timeouts and `Retry-After`. Service-level tests use 
   until it expires. Store rotated tokens in a secret store for long-running deployments.
 * **One channel** per deployment. **Template-only** intake (no free text yet). Edited messages are not re-processed.
 * **Catch-up** after a `missed` lifecycle event scans only the 50 most recent channel messages.
+* **The host must stay up for Teams intake.** Graph subscriptions last about 3 days and are renewed in the background. If
+  OpsBridge or the ngrok tunnel is down past expiry (a laptop that was off over a weekend), new Teams messages stop
+  arriving. `/health` then reports `teams_subscription: expired/none` with HTTP 503. Once the app and tunnel are back,
+  the worker recreates the subscription automatically within 5 minutes, or run `POST /subscriptions/create`. Messages
+  posted while it was down are not recovered.
+* **Knowledge base is single-node.** Vectors are compared in Python and keyword search uses SQLite FTS5. That's fine
+  for thousands of entries. Move to PostgreSQL + pgvector beyond that ([design decisions](docs/design-decisions.md#dd-4-migration-path-to-postgresql--pgvector)).
+  Knowledge is only as good as close reasons and Jira comments, so encourage `close <what fixed it>`.
 * **Jira sync posts net changes.** With polling, a status that changes and changes back between two polls
   (A → B → A) isn't posted. The webhook sees every change. Polling also can't say *who* made the change.
 * **Admin auth** is a single shared API key. Production would use Entra ID (OAuth) with roles.
@@ -581,11 +711,13 @@ and processing state stored per request.
 * SLA tracking per priority, a support-request dashboard and analytics (the `support_requests` table already holds the data)
 * Durable broker (transactional outbox → Service Bus / RabbitMQ / SQS), PostgreSQL, Alembic, Entra-ID-protected admin API
 
-**Phase 3 – AI-powered support**
+**Phase 3 – AI-powered support** (foundation done: `app/llm/` gateway, providers, redaction, budget, versioned prompts;
+`ask` self-service, knowledge capture and similar-issue lookup are implemented)
 * Natural-language intake: an `LlmRequestParser` implementing `RequestParser`, plugged in at `container.py`, with the same
   validator guarding its output
-* Priority recommendations, similar-issue lookup, routing suggestions and AI-generated summaries, as additional
-  services that enrich `TicketRequest` before `JiraService` builds the payload
+* Suggest matching past fixes inside the "ticket created" reply, using the same `KnowledgeSearch`
+* Priority recommendations, routing suggestions and AI-generated ticket summaries, as additional services that
+  enrich `TicketRequest` before `JiraService` builds the payload
 
 ---
 

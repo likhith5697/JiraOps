@@ -87,6 +87,10 @@ class SupportRequest(Base):
     # OpsBridge's own (already announced by the command reply) and is not posted again.
     jira_expected_status: Mapped[str | None] = mapped_column(String(128))
 
+    # --- Knowledge capture (after close) --------------------------------------------------------
+    knowledge_status: Mapped[str | None] = mapped_column(String(16))  # CAPTURED | SKIPPED | FAILED
+    knowledge_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
     # --- Processing state ---------------------------------------------------------------------
     processing_status: Mapped[ProcessingStatus] = mapped_column(
         Enum(ProcessingStatus, native_enum=False, length=32, validate_strings=True),

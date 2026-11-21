@@ -75,11 +75,15 @@ def _with_marker(lines: list[str], command_id: int) -> str:
 def render_close_success(*, command_id: int, jira_key: str, jira_url: str, sender_name: str,
                          reason: str | None) -> str:
     e = html.escape
-    return _with_marker([
+    lines = [
         f"✅ {e(jira_key)} has been closed by {e(sender_name)}.",
         f"Reason: {e(reason or 'Not provided')}",
         f'Jira: <a href="{e(jira_url, quote=True)}">{e(jira_url)}</a>',
-    ], command_id)
+    ]
+    if not reason:
+        lines.append("Tip: add a reason next time (<code>close &lt;what fixed it&gt;</code>) so OpsBridge can "
+                     "help others with the same problem.")
+    return _with_marker(lines, command_id)
 
 
 def render_close_already(*, command_id: int, jira_key: str) -> str:
@@ -162,6 +166,17 @@ def render_ticket_closed(*, command_id: int, jira_key: str) -> str:
 
 def render_invalid_args(*, command_id: int, message: str) -> str:
     return _with_marker([html.escape(message)], command_id)
+
+
+def render_feedback_ack(*, command_id: int, recorded: bool, helpful: bool) -> str:
+    if not recorded:
+        text = "You've already rated this answer. Thanks!"
+    elif helpful:
+        text = "👍 Thanks! Your feedback helps OpsBridge rank the most useful fixes first."
+    else:
+        text = ("👎 Thanks for letting us know. If you're still stuck, post a support request "
+                "and a ticket will be created.")
+    return _with_marker([text], command_id)
 
 
 def update_marker(notification_id: int) -> str:

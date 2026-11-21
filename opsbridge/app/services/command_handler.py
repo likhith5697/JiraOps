@@ -53,6 +53,7 @@ from app.services.notification_service import (
     render_close_success,
     render_escalated,
     render_escalation_alert,
+    render_feedback_ack,
     render_invalid_args,
     render_no_transition,
     render_not_closed,
@@ -90,6 +91,9 @@ class CommandSpec:
     executor: Callable[[TeamsCommand, SupportRequest, str], None]
     privileged: bool  # True: requester or admin only
     verb: str         # used in messages: "You're not allowed to {verb} OPS-1"
+    # Where the command may be used: "ticket" = thread of a request with a Jira issue,
+    # "ask" = thread of an `ask` answer.
+    contexts: frozenset[str] = frozenset({"ticket"})
 
 
 class LeaseLost(Exception):
@@ -135,20 +139,26 @@ class CommandIntake:
 
     def accept_reply(self, *, team_id: str, channel_id: str, parent_message_id: str, reply_message_id: str,
                      trace_id: str | None) -> InsertResult | None:
-        """Persist a reply as a command candidate if it is in the thread of a ticketed request.
+        """Persist a reply as a command candidate if it is in the thread of a ticketed request or of
+        an `ask` question.
 
         Returns None (ignored, nothing stored) for replies in unknown threads or in threads whose
         request has no Jira issue yet: those can never be commands.
         """
+        from app.repositories.ask_repository import AskRepository
+
         with self.db.session() as session:
             parent = SupportRepository(session).get_by_message_id(parent_message_id)
             parent_id = parent.id if parent and parent.jira_issue_key else None
-        if parent_id is None:
+            ask = None if parent_id else AskRepository(session).get_by_message_id(parent_message_id)
+            ask_id = ask.id if ask else None
+        if parent_id is None and ask_id is None:
             return None
         with self.db.session() as session:
             result = CommandRepository(session).insert_received(
                 reply_message_id=reply_message_id, parent_message_id=parent_message_id,
-                support_request_id=parent_id, team_id=team_id, channel_id=channel_id, trace_id=trace_id,
+                support_request_id=parent_id, ask_query_id=ask_id, team_id=team_id, channel_id=channel_id,
+                trace_id=trace_id,
             )
         if result.created and self.dispatcher is not None:
             self.dispatcher.enqueue_command(result.request_id)
@@ -176,12 +186,22 @@ class CommandHandler:
         self.parser = parser
         self.config = config
         self.worker_id = worker_id
+        # Set by the container: called with the request id after a successful close.
+        self.on_closed: Callable[[int], None] | None = None
+        # Set by the container: AskService (for `ask` and feedback commands).
+        self.ask_service: Any = None
         # Command registry. A new command = one parser entry + one CommandSpec here.
         self._commands: dict[str, CommandSpec] = {
             "close": CommandSpec(self._execute_close, privileged=True, verb="close"),
             "reopen": CommandSpec(self._execute_reopen, privileged=True, verb="reopen"),
             "status": CommandSpec(self._execute_status, privileged=False, verb="view"),
             "escalate": CommandSpec(self._execute_escalate, privileged=True, verb="escalate"),
+            "ask": CommandSpec(self._execute_ask, privileged=False, verb="ask",
+                               contexts=frozenset({"ticket", "ask"})),
+            "helpful": CommandSpec(self._execute_feedback, privileged=False, verb="rate",
+                                   contexts=frozenset({"ticket", "ask"})),
+            "not_helpful": CommandSpec(self._execute_feedback, privileged=False, verb="rate",
+                                       contexts=frozenset({"ticket", "ask"})),
         }
 
     # ---- entry point -----------------------------------------------------------------------------
@@ -239,21 +259,27 @@ class CommandHandler:
             self._update(cmd.id, worker, status=C.IGNORED, error_message=reason or "Not a command", **info)
             return
 
-        request = self._request(cmd.support_request_id)
-        if not request.jira_issue_key:  # defensive: intake already checks this
+        context = "ticket" if cmd.support_request_id else "ask"
+        if context not in spec.contexts:
+            self._update(cmd.id, worker, status=C.IGNORED,
+                         error_message=f"'{parsed.name}' is not applicable in this thread", **info)
+            return
+        request = self._request(cmd.support_request_id) if cmd.support_request_id else None
+        if request is not None and not request.jira_issue_key:  # defensive: intake already checks this
             self._update(cmd.id, worker, status=C.IGNORED, error_message="Request has no Jira issue", **info)
             return
 
         info.update(command=parsed.name, reason=parsed.reason, details=dict(parsed.args) or None, retry_count=0)
-        if spec.privileged and not self._is_authorized(reply.sender_id, request):
-            logger.warning("unauthorized command", extra={"command": parsed.name, "jira_key": request.jira_issue_key})
+        if spec.privileged and (request is None or not self._is_authorized(reply.sender_id, request)):
+            logger.warning("unauthorized command", extra={"command": parsed.name})
             self._update(cmd.id, worker, status=C.REPLYING, outcome=O.UNAUTHORIZED, **info)
             return
         if parsed.error:
             info["details"] = {**(info["details"] or {}), "error": parsed.error}
             self._update(cmd.id, worker, status=C.REPLYING, outcome=O.INVALID_ARGS, **info)
             return
-        logger.info("command accepted", extra={"command": parsed.name, "jira_key": request.jira_issue_key})
+        logger.info("command accepted", extra={"command": parsed.name,
+                                               "jira_key": request.jira_issue_key if request else None})
         self._update(cmd.id, worker, status=C.EXECUTING, **info)
 
     def _ignore_reason(self, m: InboundMessage) -> str | None:
@@ -277,7 +303,40 @@ class CommandHandler:
         spec = self._commands.get(cmd.command or "")
         if spec is None:
             raise PermanentError(f"no executor registered for command '{cmd.command}'", service="opsbridge")
-        spec.executor(cmd, self._request(cmd.support_request_id), worker)
+        spec.executor(cmd, self._request(cmd.support_request_id) if cmd.support_request_id else None, worker)
+
+    # -- ask (thread reply) ---------------------------------------------------------------------------------
+    def _execute_ask(self, cmd: TeamsCommand, request: SupportRequest | None, worker: str) -> None:
+        """Hand the question to AskService, which answers in this thread. Never touches Jira."""
+        if self.ask_service is None:
+            raise ConfigurationError("ask service is not configured")
+        self.ask_service.accept(
+            teams_message_id=cmd.reply_message_id, reply_to_message_id=cmd.parent_message_id,
+            team_id=cmd.teams_team_id, channel_id=cmd.teams_channel_id, sender_id=cmd.sender_id,
+            sender_name=cmd.sender_name, question=cmd.reason, trace_id=cmd.trace_id,
+        )
+        # The answer is the reply; this command row needs none of its own.
+        self._update(cmd.id, worker, status=C.COMPLETED, outcome=O.ASK_ROUTED, error_message=None, retry_count=0)
+
+    # -- helpful / not helpful ----------------------------------------------------------------------------
+    def _execute_feedback(self, cmd: TeamsCommand, request: SupportRequest | None, worker: str) -> None:
+        if self.ask_service is None:
+            raise ConfigurationError("ask service is not configured")
+        ask_id = cmd.ask_query_id
+        if ask_id is None:  # feedback in a ticket thread: the latest answer given in that thread
+            from app.repositories.ask_repository import AskRepository
+
+            with self.db.session() as session:
+                latest = AskRepository(session).latest_answered_in_thread(cmd.parent_message_id)
+                ask_id = latest.id if latest else None
+        if ask_id is None:
+            self._update(cmd.id, worker, status=C.IGNORED, error_message="No answer to rate in this thread")
+            return
+        result = self.ask_service.record_feedback(
+            ask_id, sender_id=cmd.sender_id or "", value=cmd.command or "", reply_message_id=cmd.reply_message_id)
+        outcome = O.FEEDBACK_RECORDED if result == "recorded" else O.FEEDBACK_ALREADY_GIVEN
+        self._update(cmd.id, worker, status=C.REPLYING, outcome=outcome, retry_count=0,
+                     details=self._merge(cmd, ask_query_id=ask_id))
 
     # -- close ------------------------------------------------------------------------------------------
     def _execute_close(self, cmd: TeamsCommand, request: SupportRequest, worker: str) -> None:
@@ -305,6 +364,8 @@ class CommandHandler:
                 req.processing_status = ProcessingStatus.CLOSED
         logger.info("support request marked closed", extra={"request_id": cmd.support_request_id})
         self._update(cmd.id, worker, status=C.REPLYING, outcome=O.CLOSED, error_message=None, retry_count=0)
+        if self.on_closed is not None:  # knowledge capture (background; never blocks the close)
+            self.on_closed(cmd.support_request_id)
 
     # -- reopen -----------------------------------------------------------------------------------------
     def _execute_reopen(self, cmd: TeamsCommand, request: SupportRequest, worker: str) -> None:
@@ -463,8 +524,9 @@ class CommandHandler:
 
     # ---- stage 3: reply in the Teams thread ------------------------------------------------------------
     def _stage_reply(self, cmd: TeamsCommand, worker: str) -> None:
-        request = self._request(cmd.support_request_id)
-        target = ReplyTarget(request.id, cmd.teams_team_id, cmd.teams_channel_id, cmd.parent_message_id)
+        request = self._request(cmd.support_request_id) if cmd.support_request_id else None
+        target = ReplyTarget(request.id if request else 0, cmd.teams_team_id, cmd.teams_channel_id,
+                             cmd.parent_message_id)
         marker = command_marker(cmd.id)
         done = C.COMPLETED if cmd.outcome and cmd.outcome.is_success else C.REJECTED
 
@@ -480,12 +542,18 @@ class CommandHandler:
         self._update(cmd.id, worker, status=done, replied_at=utcnow(), response_message_id=reply_id,
                      error_message=None, retry_count=0)
 
-    def _render(self, cmd: TeamsCommand, request: SupportRequest) -> str:
-        key, url = request.jira_issue_key or "", request.jira_issue_url or ""
+    def _render(self, cmd: TeamsCommand, request: SupportRequest | None) -> str:
+        key = (request.jira_issue_key or "") if request else ""
+        url = (request.jira_issue_url or "") if request else ""
         d = cmd.details or {}
         sender = cmd.sender_name or "Unknown user"
         verb = self._commands[cmd.command].verb if cmd.command in self._commands else "change"
         outcome = cmd.outcome
+        if outcome in (O.FEEDBACK_RECORDED, O.FEEDBACK_ALREADY_GIVEN):
+            return render_feedback_ack(command_id=cmd.id, recorded=outcome == O.FEEDBACK_RECORDED,
+                                       helpful=cmd.command == "helpful")
+        if outcome == O.UNAUTHORIZED and request is None:
+            return render_invalid_args(command_id=cmd.id, message=f"`{cmd.command}` only works in a ticket's thread.")
         if outcome == O.CLOSED:
             return render_close_success(command_id=cmd.id, jira_key=key, jira_url=url, sender_name=sender,
                                         reason=cmd.reason)

@@ -13,7 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app import __version__
-from app.api import dev, health, subscriptions, support_requests, webhooks
+from app.api import dev, health, knowledge, subscriptions, support_requests, webhooks
 from app.config import Settings, get_settings
 from app.container import Container, build_container
 from app.core.logging import configure_logging
@@ -66,6 +66,7 @@ def create_app(settings: Settings | None = None, container: Container | None = N
     app.include_router(webhooks.router)
     app.include_router(subscriptions.router)
     app.include_router(support_requests.router)
+    app.include_router(knowledge.router)
     if settings.mock_mode:
         app.include_router(dev.router)
     return app

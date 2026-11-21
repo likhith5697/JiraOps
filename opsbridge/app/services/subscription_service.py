@@ -129,6 +129,20 @@ class SubscriptionService:
             return SubscriptionOutcome(SubscriptionRepository(session).get_by_subscription_id(sub.subscription_id),
                                        "renewed")  # type: ignore[arg-type]
 
+    def ensure_active(self) -> SubscriptionOutcome | None:
+        """Recreate the subscription when one existed before but none is active now (expired while
+        the host was off, or a recreate failed). Never creates the first one: that stays an explicit
+        admin action (POST /subscriptions/create)."""
+        with self.db.session() as session:
+            repo = SubscriptionRepository(session)
+            if repo.active_for_resource(self.resource) is not None:
+                return None
+            had_one = any(s.resource == self.resource for s in repo.list())
+        if not had_one:
+            return None
+        logger.warning("no active Teams subscription; recreating it")
+        return SubscriptionOutcome(self._create_new(), "recreated")
+
     def handle_removed(self, subscription_id: str) -> None:
         self._set_status(subscription_id, SubscriptionStatus.REMOVED, "subscriptionRemoved lifecycle event")
         self._create_new()

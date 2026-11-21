@@ -47,6 +47,9 @@ class CommandOutcome(StrEnum):
     REOPENED = "REOPENED"
     STATUS_REPORTED = "STATUS_REPORTED"
     ESCALATED = "ESCALATED"
+    ASK_ROUTED = "ASK_ROUTED"                       # `ask` handed to AskService (it replies)
+    FEEDBACK_RECORDED = "FEEDBACK_RECORDED"
+    FEEDBACK_ALREADY_GIVEN = "FEEDBACK_ALREADY_GIVEN"
     # refusals (user is told why; nothing changed)
     UNAUTHORIZED = "UNAUTHORIZED"
     NO_TRANSITION = "NO_TRANSITION"
@@ -58,7 +61,8 @@ class CommandOutcome(StrEnum):
     @property
     def is_success(self) -> bool:
         return self in (CommandOutcome.CLOSED, CommandOutcome.ALREADY_CLOSED, CommandOutcome.REOPENED,
-                        CommandOutcome.STATUS_REPORTED, CommandOutcome.ESCALATED)
+                        CommandOutcome.STATUS_REPORTED, CommandOutcome.ESCALATED, CommandOutcome.ASK_ROUTED,
+                        CommandOutcome.FEEDBACK_RECORDED, CommandOutcome.FEEDBACK_ALREADY_GIVEN)
 
 
 class NotificationStatus(StrEnum):
@@ -71,6 +75,17 @@ class NotificationStatus(StrEnum):
     @classmethod
     def active(cls) -> tuple["NotificationStatus", ...]:
         return (cls.PENDING,)
+
+
+class AskStatus(StrEnum):
+    RECEIVED = "RECEIVED"  # question stored; search + answer pending
+    REPLYING = "REPLYING"  # answer computed and stored; Teams reply pending
+    ANSWERED = "ANSWERED"  # terminal
+    FAILED = "FAILED"      # terminal: retries exhausted / permanent error
+
+    @classmethod
+    def active(cls) -> tuple["AskStatus", ...]:
+        return (cls.RECEIVED, cls.REPLYING)
 
 
 class Environment(StrEnum):

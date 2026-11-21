@@ -229,3 +229,17 @@ Replies in a ticketed request thread can be commands: `close [reason]`, `reopen 
   The Jira account isn't used to spot OpsBridge's own changes: in small setups it's often the same person's account.
 * **Delivery.** `ThreadUpdateNotifier` posts outbox rows through the same background worker (lease, backoff,
   `Retry-After`, and a marker search after an ambiguous Teams timeout). The sweeper also starts the periodic poll.
+
+### 3.14 AI-assisted self-service (`ask`) and the LLM layer
+
+* `app/llm/` is provider-neutral: the `LLMProvider` / `EmbeddingProvider` protocols, Anthropic, OpenAI, Ollama and mock
+  implementations over raw HTTPX, and `LLMGateway`. The gateway is the only entry point. It enforces the daily token
+  budget (persisted in `llm_usage_daily`), re-redacts input, logs usage without prompts, and turns every failure
+  into `LLMUnavailable`, which callers answer with the non-LLM path.
+* `KnowledgeService` turns each closed request into a `knowledge_entries` row, triggered on close and by a background
+  sweep. `KnowledgeSearch` does hybrid retrieval. `AskService` answers through the same lease, backoff and outbox
+  machinery as everything else (`ask_queries`, `ask_feedback`).
+* Routing: a top-level `ask …` is diverted *before* template validation. Replies, in ticket threads or `ask` threads,
+  go through `teams_commands`, whose `support_request_id` is now nullable alongside a new `ask_query_id`. The startup
+  migration relaxes the NOT NULL with a safe SQLite table rebuild.
+* Rationale and the PostgreSQL + pgvector path: [design-decisions.md](design-decisions.md).

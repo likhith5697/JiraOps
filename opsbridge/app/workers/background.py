@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from app.core.logging import log_context
 from app.database.session import Database
+from app.repositories.ask_repository import AskRepository
 from app.repositories.command_repository import CommandRepository
 from app.repositories.notification_repository import NotificationRepository
 from app.repositories.support_repository import SupportRepository
@@ -35,10 +36,11 @@ class SyncDispatcher:
     """Runs work inline. Used by tests and one-off scripts."""
 
     def __init__(self, processor: MessageProcessor | None = None, commands: CommandHandler | None = None,
-                 notifications: ThreadUpdateNotifier | None = None) -> None:
+                 notifications: ThreadUpdateNotifier | None = None, asks=None) -> None:  # noqa: ANN001
         self.processor = processor
         self.commands = commands
         self.notifications = notifications
+        self.asks = asks  # AskService
         self.enqueued: list[int] = []
         self.enqueued_commands: list[int] = []
         self.enqueued_notifications: list[int] = []
@@ -57,6 +59,10 @@ class SyncDispatcher:
         self.enqueued_notifications.append(notification_id)
         if self.notifications is not None:
             self.notifications.process(notification_id)
+
+    def enqueue_ask(self, ask_id: int) -> None:
+        if self.asks is not None:
+            self.asks.process(ask_id)
 
     def submit(self, fn: Callable[..., Any], *args: Any) -> None:
         fn(*args)
@@ -84,7 +90,11 @@ class BackgroundWorker:
         self.notifications = notifications
         self.jira_sync = jira_sync
         self.jira_poll_interval = jira_poll_interval
-        self._last_jira_poll = 0.0
+        self._last_jira_poll = float("-inf")  # run on the first sweep (monotonic starts near 0 after a VM boot)
+        self.knowledge = None  # KnowledgeService, set by the container
+        self.asks = None  # AskService, set by the container
+        self.knowledge_sweep_interval = 60.0
+        self._last_knowledge_sweep = float("-inf")  # run on the first sweep (monotonic starts near 0 after a VM boot)
         self.worker_count = worker_count
         self.poll_interval = poll_interval
         self.subscription_check_interval = subscription_check_interval
@@ -94,7 +104,7 @@ class BackgroundWorker:
         self._stop = threading.Event()
         self._inflight: set[tuple[str, int]] = set()  # (kind, id)
         self._lock = threading.Lock()
-        self._last_subscription_check = 0.0
+        self._last_subscription_check = float("-inf")  # run on the first sweep (monotonic starts near 0 after a VM boot)
 
     @property
     def running(self) -> bool:
@@ -128,6 +138,10 @@ class BackgroundWorker:
         if self.notifications is not None:
             self._enqueue("notification", notification_id)
 
+    def enqueue_ask(self, ask_id: int) -> None:
+        if self.asks is not None:
+            self._enqueue("ask", ask_id)
+
     def _enqueue(self, kind: str, item_id: int) -> None:
         with self._lock:
             if (kind, item_id) in self._inflight or self._executor is None:
@@ -150,6 +164,8 @@ class BackgroundWorker:
                 self.commands.process(item_id, worker_id=worker_id)  # type: ignore[union-attr]
             elif kind == "notification":
                 self.notifications.process(item_id, worker_id=worker_id)  # type: ignore[union-attr]
+            elif kind == "ask":
+                self.asks.process(item_id, worker_id=worker_id)  # type: ignore[union-attr]
             else:
                 self.processor.process(item_id, worker_id=worker_id)
         except Exception:  # never kill the pool thread
@@ -174,20 +190,33 @@ class BackgroundWorker:
                     due_commands = CommandRepository(session).due_ids(limit=100) if self.commands else []
                     due_notifications = (NotificationRepository(session).due_ids(limit=100)
                                          if self.notifications else [])
+                    due_asks = AskRepository(session).due_ids(limit=100) if self.asks else []
                 for request_id in due:
                     self.enqueue(request_id)
                 for command_id in due_commands:
                     self.enqueue_command(command_id)
                 for notification_id in due_notifications:
                     self.enqueue_notification(notification_id)
+                for ask_id in due_asks:
+                    self.enqueue_ask(ask_id)
                 if due or due_commands:
                     logger.debug("sweeper enqueued due work", extra={"requests": len(due),
                                                                      "commands": len(due_commands)})
                 self._maybe_renew_subscriptions()
                 self._maybe_poll_jira()
+                self._maybe_sweep_knowledge()
             except Exception:
                 logger.exception("sweeper iteration failed")
             self._stop.wait(self.poll_interval)
+
+    def _maybe_sweep_knowledge(self) -> None:
+        if self.knowledge is None:
+            return
+        now = time.monotonic()
+        if now - self._last_knowledge_sweep < self.knowledge_sweep_interval:
+            return
+        self._last_knowledge_sweep = now
+        self.submit(self.knowledge.sweep)
 
     def _maybe_poll_jira(self) -> None:
         if self.jira_sync is None or self.jira_poll_interval <= 0:
@@ -212,3 +241,10 @@ class BackgroundWorker:
                     logger.info("subscription renewal check", extra={"renewed": [o.action for o in outcomes]})
             except Exception:
                 logger.exception("subscription renewal failed; will retry next interval")
+            try:
+                # Self-heal: an earlier recreate may have failed (e.g. tunnel down), leaving none active.
+                healed = self.subscriptions.ensure_active()
+                if healed:
+                    logger.info("Teams subscription restored", extra={"subscription_id": healed.subscription.subscription_id})
+            except Exception:
+                logger.exception("could not restore Teams subscription; will retry next interval")

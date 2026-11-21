@@ -87,6 +87,8 @@ class JiraClient(Protocol):
 
     def find_comment_containing(self, key: str, text: str) -> str | None: ...
 
+    def list_comments(self, key: str, limit: int = 5) -> list[str]: ...
+
     def close(self) -> None: ...
 
 
@@ -250,6 +252,12 @@ class HttpJiraClient:
     def add_comment(self, key: str, body: dict[str, Any]) -> str:
         data = self._send("POST", self._issue_path(key, "/comment"), idempotent=False, json={"body": body}).json()
         return str(data.get("id", ""))
+
+    def list_comments(self, key: str, limit: int = 5) -> list[str]:
+        """Plain text of the newest `limit` comments, newest first."""
+        data = self._send("GET", self._issue_path(key, "/comment"), idempotent=True,
+                          params={"orderBy": "-created", "maxResults": limit}).json()
+        return [adf_plain_text(c.get("body")) for c in data.get("comments", [])][:limit]
 
     def find_comment_containing(self, key: str, text: str) -> str | None:
         data = self._send("GET", self._issue_path(key, "/comment"), idempotent=True,
@@ -446,6 +454,10 @@ class MockJiraClient:
             if mode == "comment_ambiguous_after":
                 raise AmbiguousError("mock read timeout after comment", service=SERVICE)
             return comment_id
+
+    def list_comments(self, key: str, limit: int = 5) -> list[str]:
+        with self._lock:
+            return [adf_plain_text(c["body"]) for c in reversed(self._issue(key)["comments"])][:limit]
 
     def find_comment_containing(self, key: str, text: str) -> str | None:
         with self._lock:

@@ -81,6 +81,20 @@ class Settings(BaseSettings):
     # Shared secret for POST /webhooks/jira (HMAC header or ?secret=). Empty = endpoint disabled.
     jira_webhook_secret: SecretStr = SecretStr("")
 
+    # --- AI / LLM (optional; everything works without it) ------------------------------------
+    llm_enabled: bool = False
+    llm_provider: Literal["anthropic", "openai", "ollama", "mock"] = "mock"
+    llm_model: str = ""          # empty = provider default
+    llm_api_key: SecretStr = SecretStr("")
+    embedding_provider: Literal["openai", "ollama", "mock", "none"] = "mock"
+    embedding_model: str = ""    # empty = provider default
+    embedding_api_key: SecretStr = SecretStr("")  # falls back to LLM_API_KEY for openai
+    ollama_base_url: str = "http://localhost:11434"
+    llm_timeout_seconds: float = Field(default=30.0, gt=0)
+    llm_daily_token_budget: int = Field(default=200_000, ge=0)  # 0 = unlimited
+    ask_min_score: float = Field(default=0.35, ge=0.0, le=1.0)
+    ask_top_k: int = Field(default=3, ge=1, le=10)
+
     # --- Database --------------------------------------------------------------------------
     database_url: str = "sqlite:///./opsbridge.db"
 
@@ -135,6 +149,11 @@ class Settings(BaseSettings):
                 raise ConfigurationError(
                     "MOCK_MODE=false but required settings are missing: " + ", ".join(missing)
                 )
+        if self.llm_enabled and self.llm_provider in ("anthropic", "openai") and not self.llm_api_key.get_secret_value():
+            raise ConfigurationError(f"LLM_ENABLED=true with LLM_PROVIDER={self.llm_provider} requires LLM_API_KEY")
+        if self.embedding_provider == "openai" and not (self.embedding_api_key.get_secret_value()
+                                                         or self.llm_api_key.get_secret_value()):
+            raise ConfigurationError("EMBEDDING_PROVIDER=openai requires EMBEDDING_API_KEY (or LLM_API_KEY)")
         if self.effective_escalation_channel_id and self.effective_escalation_channel_id == self.effective_channel_id:
             # Alerts posted into the support channel would be ingested as new support requests.
             raise ConfigurationError("TEAMS_ESCALATION_CHANNEL_ID must be a different channel from TEAMS_CHANNEL_ID")

@@ -39,10 +39,19 @@ class Database:
     def create_all(self) -> None:
         # Import models so they register with Base.metadata.
         from app.database.migrations import apply_additive_migrations
-        from app.models import graph_subscription, support_request, teams_command, teams_notification  # noqa: F401
+        from app.repositories.knowledge_repository import ensure_search_index
+        from app.models import (  # noqa: F401
+            graph_subscription,
+            knowledge,
+            llm_usage,
+            support_request,
+            teams_command,
+            teams_notification,
+        )
 
         Base.metadata.create_all(self.engine)
         apply_additive_migrations(self.engine)
+        ensure_search_index(self.engine)
 
     @contextmanager
     def session(self) -> Iterator[Session]:

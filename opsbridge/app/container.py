@@ -21,6 +21,11 @@ from app.integrations.microsoft_graph import (
 from app.services.command_handler import CommandConfig, CommandHandler, CommandIntake
 from app.services.command_parser import CommandParser
 from app.services.ingestion_service import Dispatcher, IngestionService
+from app.llm.factory import build_llm_gateway
+from app.llm.gateway import LLMGateway
+from app.services.ask_service import AskConfig, AskService
+from app.services.knowledge_search import KnowledgeSearch
+from app.services.knowledge_service import KnowledgeService
 from app.services.jira_sync_service import DeliveryConfig, JiraSyncService, SyncConfig, ThreadUpdateNotifier
 from app.services.jira_service import JiraService
 from app.services.message_processor import MessageProcessor, ProcessorConfig
@@ -45,6 +50,10 @@ class Container:
     command_intake: CommandIntake
     jira_sync: JiraSyncService
     thread_updates: ThreadUpdateNotifier
+    llm: LLMGateway
+    knowledge: KnowledgeService
+    search: KnowledgeSearch
+    asks: AskService
     dispatcher: Any  # BackgroundWorker | SyncDispatcher
     ingestion: IngestionService
     subscriptions: SubscriptionService
@@ -55,6 +64,7 @@ class Container:
             self.dispatcher.stop()
         self.graph.close()
         self.jira_client.close()
+        self.llm.close()
         self.db.dispose()
 
 
@@ -109,6 +119,7 @@ def build_container(
     settings: Settings,
     *,
     db: Database | None = None,
+    llm: LLMGateway | None = None,
     graph: GraphClient | None = None,
     jira_client: JiraClient | None = None,
     parser: RequestParser | None = None,
@@ -189,9 +200,24 @@ def build_container(
         lifetime_minutes=settings.graph_subscription_lifetime_minutes,
         renewal_threshold_minutes=settings.graph_subscription_renewal_threshold_minutes,
     )
+    # --- AI-assisted self-service (knowledge base + `ask`) ---------------------------------------
+    llm = llm or build_llm_gateway(settings, db)
+    knowledge = KnowledgeService(db=db, jira=jira_client, llm=llm)
+    search = KnowledgeSearch(db=db, llm=llm, min_score=settings.ask_min_score, top_k=settings.ask_top_k)
+    asks = AskService(
+        db=db, search=search, llm=llm, notifier=notifier,
+        config=AskConfig(
+            worker_lease_seconds=settings.worker_lease_seconds,
+            max_retries=settings.max_retries,
+            retry_base_delay_seconds=settings.retry_base_delay_seconds,
+            retry_max_delay_seconds=settings.retry_max_delay_seconds,
+        ),
+    )
+    commands.ask_service = asks
+
     use_sync = (not settings.background_worker_enabled) if sync_dispatch is None else sync_dispatch
     dispatcher: Dispatcher = (
-        SyncDispatcher(processor, commands, thread_updates)
+        SyncDispatcher(processor, commands, thread_updates, asks=asks)
         if use_sync
         else BackgroundWorker(
             db=db,
@@ -219,6 +245,16 @@ def build_container(
     if isinstance(dispatcher, BackgroundWorker) and settings.jira_sync_enabled:
         dispatcher.jira_sync = jira_sync
         dispatcher.jira_poll_interval = settings.jira_sync_poll_interval_seconds
+    asks.dispatcher = dispatcher
+    commands.on_closed = lambda request_id: dispatcher.submit(knowledge.capture_safely, request_id)
+    processor.on_ask = lambda message, question, trace_id: asks.accept(
+        teams_message_id=message.message_id, reply_to_message_id=message.message_id, team_id=message.team_id,
+        channel_id=message.channel_id, sender_id=message.sender_id, sender_name=message.sender_name,
+        question=question, trace_id=trace_id,
+    )
+    if isinstance(dispatcher, BackgroundWorker):
+        dispatcher.knowledge = knowledge
+        dispatcher.asks = asks
     command_intake = CommandIntake(db=db, dispatcher=dispatcher)
     processor.on_reply = command_intake.accept_message  # route fetched replies to command handling
     ingestion = IngestionService(
@@ -242,6 +278,10 @@ def build_container(
         command_intake=command_intake,
         jira_sync=jira_sync,
         thread_updates=thread_updates,
+        llm=llm,
+        knowledge=knowledge,
+        search=search,
+        asks=asks,
         dispatcher=dispatcher,
         ingestion=ingestion,
         subscriptions=subscriptions,

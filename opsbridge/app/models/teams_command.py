@@ -26,7 +26,9 @@ class TeamsCommand(Base):
     # --- Teams origin ---------------------------------------------------------------------
     reply_message_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     parent_message_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
-    support_request_id: Mapped[int] = mapped_column(ForeignKey("support_requests.id"), nullable=False, index=True)
+    # Exactly one of these is set: the reply is in a ticket's thread, or in an `ask` answer's thread.
+    support_request_id: Mapped[int | None] = mapped_column(ForeignKey("support_requests.id"), nullable=True, index=True)
+    ask_query_id: Mapped[int | None] = mapped_column(ForeignKey("ask_queries.id"), nullable=True, index=True)
     teams_team_id: Mapped[str] = mapped_column(String(128), nullable=False)
     teams_channel_id: Mapped[str] = mapped_column(String(256), nullable=False)
     sender_id: Mapped[str | None] = mapped_column(String(128))

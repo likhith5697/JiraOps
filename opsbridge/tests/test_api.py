@@ -30,7 +30,8 @@ def test_admin_endpoints_require_api_key(client, method, path):
 def test_health_is_public(client):
     body = client.get("/health").json()
     assert body["status"] == "ok"
-    assert body["checks"] == {"database": "ok", "worker": "inline"}
+    assert body["checks"] == {"database": "ok", "worker": "inline", "teams_subscription": "none",
+                              "teams_subscription_expires_at": None}
     assert body["mock_mode"] is True
 
 
@@ -148,3 +149,81 @@ def test_unhandled_errors_return_trace_id(container, admin_headers):
     assert response.json()["detail"] == "Internal server error"
     assert response.json()["trace_id"]
     assert "exploded" not in response.text
+
+
+def test_health_reports_subscription_state(client, container, admin_headers):
+    from datetime import timedelta
+
+    from app.core.time import utcnow
+    from app.models.graph_subscription import GraphSubscription
+
+    client.post("/subscriptions/create", headers=admin_headers)
+    assert client.get("/health").json()["checks"]["teams_subscription"] == "active"
+    with container.db.session() as session:  # e.g. host was off past the renewal window
+        for sub in session.query(GraphSubscription).all():
+            sub.expiration_at = utcnow() - timedelta(hours=1)
+    body = client.get("/health").json()
+    assert body["checks"]["teams_subscription"] == "expired"
+    assert body["status"] == "ok"  # mock mode: reported, not degraded
+
+
+def test_periodic_jobs_run_on_first_sweep_even_right_after_boot(monkeypatch, container):
+    """time.monotonic() starts near 0 after a (Docker VM) boot; the first renewal/poll/sweep must not wait."""
+    from app.workers import background
+    from app.workers.background import BackgroundWorker
+
+    monkeypatch.setattr(background.time, "monotonic", lambda: 5.0)  # 5 s after boot
+    calls = []
+
+    class Spy:
+        def renew(self, **kw):
+            calls.append(("renew", kw))
+            return []
+
+        def ensure_active(self):
+            calls.append(("ensure_active", {}))
+
+    worker = BackgroundWorker(db=container.db, processor=container.processor, subscriptions=Spy(), worker_count=1,
+                              poll_interval=10, subscription_check_interval=300, jira_sync=container.jira_sync,
+                              jira_poll_interval=120)
+    worker.knowledge = container.knowledge
+    submitted = []
+    worker.submit = lambda fn, *a: submitted.append(fn.__name__)
+    worker._maybe_renew_subscriptions()
+    worker._maybe_poll_jira()
+    worker._maybe_sweep_knowledge()
+    assert calls == [("renew", {"only_expiring": True}), ("ensure_active", {})]
+    assert submitted == ["poll_once", "sweep"]
+
+
+def test_live_mode_without_active_subscription_is_degraded(container):
+    from fastapi.testclient import TestClient
+
+    from app.main import create_app
+
+    with TestClient(create_app(container=container)) as c:
+        container.settings = container.settings.model_copy(update={"mock_mode": False})  # after startup checks
+        response = c.get("/health")
+    assert response.status_code == 503
+    assert response.json()["status"] == "degraded" and response.json()["checks"]["teams_subscription"] == "none"
+
+
+def test_subscription_self_heals_after_failed_recreate(client, container, admin_headers):
+    from app.core.errors import TransientError
+
+    assert container.subscriptions.ensure_active() is None  # never creates the first one on its own
+    old_id = client.post("/subscriptions/create", headers=admin_headers).json()["subscription"]["subscription_id"]
+    container.graph.subscriptions.clear()  # expired in Graph while the host was off
+
+    real_create = container.graph.create_subscription
+    container.graph.create_subscription = lambda **kw: (_ for _ in ()).throw(
+        TransientError("tunnel down", service="microsoft_graph"))
+    with pytest.raises(TransientError):
+        container.subscriptions.renew(only_expiring=False)  # 404 -> REMOVED -> recreate fails
+    assert client.get("/health").json()["checks"]["teams_subscription"] == "none"
+
+    container.graph.create_subscription = real_create  # tunnel is back
+    healed = container.subscriptions.ensure_active()
+    assert healed is not None and healed.action == "recreated" and healed.subscription.subscription_id != old_id
+    assert client.get("/health").json()["checks"]["teams_subscription"] == "active"
+    assert container.subscriptions.ensure_active() is None  # nothing to do once active

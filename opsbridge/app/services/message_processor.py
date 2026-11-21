@@ -75,6 +75,11 @@ class MessageProcessor:
         # Set by the container: routes a fetched reply to thread-command handling.
         # Returns a truthy value when the reply was accepted as a command candidate.
         self.on_reply: Callable[[InboundMessage, str | None], object] | None = None
+        # Set by the container: routes a top-level `ask <question>` to AskService.
+        self.on_ask: Callable[[InboundMessage, str | None, str | None], object] | None = None
+        from app.services.command_parser import CommandParser
+
+        self.command_parser = CommandParser()
 
     # =========================================================================================
     # Entry point
@@ -148,6 +153,14 @@ class MessageProcessor:
         if reason:
             logger.info("ignoring message: %s", reason)
             self._update(rec.id, worker, processing_status=S.IGNORED, error_message=reason, **common)
+            return
+
+        command = self.command_parser.parse(message.body_text) if self.on_ask is not None else None
+        if command is not None and command.name == "ask":
+            # Knowledge-base question: answered by AskService, never a support request / Jira ticket.
+            self.on_ask(message, command.reason, rec.trace_id)
+            self._update(rec.id, worker, processing_status=S.IGNORED,
+                         error_message="Routed to ask (knowledge-base question)", **common)
             return
 
         parsed = self.parser.parse(message)

@@ -13,6 +13,8 @@ Supported today:
     reopen   [reason]
     status
     escalate <P1|P2|P3> [reason]
+    ask      <question>
+    helpful | not helpful            (feedback on an `ask` answer)
 
 Adding a command = one entry in ARGUMENT_PARSERS (+ an executor in CommandHandler). The
 processor routes every parsed command to the handler, so it never changes.
@@ -29,7 +31,10 @@ from app.services.request_validator import normalise_priority
 MAX_REASON_LENGTH = 1000
 ESCALATE_USAGE = "Usage: escalate P1|P2|P3 [reason], e.g. `escalate P1 Customer-facing outage`"
 
-_COMMAND_RE = re.compile(r"^\s*/?(?P<name>[a-z]+)(?=$|[\s:])[\s:]*(?P<rest>.*)$", re.IGNORECASE | re.DOTALL)
+_COMMAND_RE = re.compile(r"^\s*/?(?P<name>[a-z]+)(?=$|[\s:!.,?])[\s:!.,]*(?P<rest>.*)$",
+                         re.IGNORECASE | re.DOTALL)
+_NOT_HELPFUL_RE = re.compile(r"^\s*/?(?:not[\s-]*helpful|unhelpful)(?=$|[\s!.,?])", re.IGNORECASE)
+ASK_USAGE = "Usage: ask <your question>, e.g. `ask why does CustomerOrderAPI return HTTP 500 in QA?`"
 
 
 @dataclass(frozen=True)
@@ -52,6 +57,10 @@ def _no_arguments(rest: str) -> tuple[dict[str, str], str, str | None]:
     return {}, "", None  # `status` ignores trailing text
 
 
+def _ask(rest: str) -> tuple[dict[str, str], str, str | None]:
+    return ({}, rest, None) if rest.strip() else ({}, "", ASK_USAGE)
+
+
 def _escalate(rest: str) -> tuple[dict[str, str], str, str | None]:
     first, _, remainder = rest.partition(" ")
     priority = normalise_priority(first) if first else None
@@ -65,6 +74,9 @@ ARGUMENT_PARSERS: dict[str, ArgumentParser] = {
     "reopen": _reason_only,
     "status": _no_arguments,
     "escalate": _escalate,
+    "ask": _ask,
+    "helpful": _no_arguments,
+    "not_helpful": _no_arguments,
 }
 SUPPORTED_COMMANDS: frozenset[str] = frozenset(ARGUMENT_PARSERS)
 
@@ -77,6 +89,8 @@ class CommandParser:
         """Return a Command for supported commands, otherwise None (ordinary chatter)."""
         if not text:
             return None
+        if "not_helpful" in self.supported and _NOT_HELPFUL_RE.match(text):
+            return Command(name="not_helpful", reason=None)
         match = _COMMAND_RE.match(text)
         if not match:
             return None
@@ -85,4 +99,5 @@ class CommandParser:
             return None
         rest = " ".join(match.group("rest").split())  # collapse newlines/extra spaces
         args, reason, error = ARGUMENT_PARSERS.get(name, _reason_only)(rest)
-        return Command(name=name, reason=reason[:MAX_REASON_LENGTH] or None, args=args, error=error)
+        limit = 2000 if name == "ask" else MAX_REASON_LENGTH
+        return Command(name=name, reason=reason[:limit] or None, args=args, error=error)

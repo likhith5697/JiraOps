@@ -34,3 +34,28 @@ def html_to_text(content: str) -> str:
     text = html.unescape("".join(extractor.parts)).replace("\xa0", " ").replace("\r\n", "\n")
     lines = [line.rstrip() for line in text.split("\n")]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+# --------------------------------------------------------------------------------------
+# Search tokenisation (shared by keyword search, mock embeddings, hint extraction)
+# --------------------------------------------------------------------------------------
+_WORD = re.compile(r"[a-z0-9]+")
+STOPWORDS = frozenset(
+    "a an and are as at be but by for from has have how i in is it its my of on or our that the their them this "
+    "to was we were what when where which who why will with you your can could does did do not no any after "
+    "before again still please help there here into about".split()
+)
+
+
+def normalise_tokens(text: str) -> list[str]:
+    """Lowercase words minus stopwords, with a light suffix stemmer (failing/failed/fails -> fail)."""
+    out = []
+    for w in _WORD.findall((text or "").lower()):
+        if w in STOPWORDS or len(w) < 2:
+            continue
+        for suffix in ("ing", "ed", "es", "s"):
+            if len(w) > len(suffix) + 2 and w.endswith(suffix):
+                w = w[: -len(suffix)]
+                break
+        out.append(w)
+    return out

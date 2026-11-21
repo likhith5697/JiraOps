@@ -53,6 +53,8 @@ class Dispatcher(Protocol):
 
     def enqueue_notification(self, notification_id: int) -> None: ...
 
+    def enqueue_ask(self, ask_id: int) -> None: ...
+
     def submit(self, fn, *args) -> None: ...  # noqa: ANN001 - generic background task
 
 

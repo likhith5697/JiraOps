@@ -19,8 +19,9 @@ class CommandRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def insert_received(self, *, reply_message_id: str, parent_message_id: str, support_request_id: int,
-                        team_id: str, channel_id: str, trace_id: str | None) -> InsertResult:
+    def insert_received(self, *, reply_message_id: str, parent_message_id: str, support_request_id: int | None,
+                        team_id: str, channel_id: str, trace_id: str | None,
+                        ask_query_id: int | None = None) -> InsertResult:
         """Insert + commit a RECEIVED command; a duplicate reply id returns the existing row.
 
         Same contract as SupportRepository.insert_received: first operation on a fresh session,
@@ -30,6 +31,7 @@ class CommandRepository:
             reply_message_id=reply_message_id,
             parent_message_id=parent_message_id,
             support_request_id=support_request_id,
+            ask_query_id=ask_query_id,
             teams_team_id=team_id,
             teams_channel_id=channel_id,
             status=CommandStatus.RECEIVED,
